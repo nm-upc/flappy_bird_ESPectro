@@ -700,7 +700,14 @@ void runGame() {
 
         bool btnA=(digitalRead(BTN_A_PIN)==LOW);
         bool btnB=(digitalRead(BTN_B_PIN)==LOW);
-        if (btnB) return;
+        if (btnB) {
+            if (fbScore > bestScore) {
+                if (xSemaphoreTake(recordMutex, pdMS_TO_TICKS(200))==pdTRUE) {
+                    saveRecord(fbScore); xSemaphoreGive(recordMutex);
+                }
+            }
+            return;
+        }
         if (btnA && !aPrev && !fbStarted) fbStarted=true;
         if (btnA && !aPrev && fbStarted) { fbBirdVY=FB_FLAP; playTone(440,30,0.07f); }
         aPrev=btnA;
@@ -712,27 +719,27 @@ void runGame() {
         fbBirdY = constrain(fbBirdY + fbBirdVY, FB_BIRD_R, SCREEN_H-FB_BIRD_R);
 
         tft.startWrite();
-        // Clear sky
-        tft.fillRect(0, 0, SCREEN_W, SCREEN_H, tft.color565(80,180,255));
 
-        // Pipes
+        // Esborra ocell anterior
+        tft.fillCircle(FB_BIRD_X, prevBirdY, FB_BIRD_R+2, tft.color565(80,180,255));
+
         bool scored=false;
         for (int i=0;i<FB_MAX_PIPES;i++) {
+            // Esborra posició anterior de la canonada
+            tft.fillRect(fbPipes[i].x+4, 0, 8, SCREEN_H-20, tft.color565(80,180,255));
+
             fbPipes[i].x -= 4;
             if (fbPipes[i].x < -FB_PIPE_W) {
                 fbPipes[i].x = SCREEN_W;
                 fbPipes[i].gapY = 80 + random(SCREEN_H - FB_GAP - 160);
             }
-            // Draw pipe
             uint16_t gc = tft.color565(50,180,50);
             tft.fillRect(fbPipes[i].x, 0, FB_PIPE_W, fbPipes[i].gapY, gc);
             tft.fillRect(fbPipes[i].x-3, fbPipes[i].gapY-15, FB_PIPE_W+6, 15, tft.color565(30,140,30));
             int botY=fbPipes[i].gapY+FB_GAP;
             tft.fillRect(fbPipes[i].x, botY, FB_PIPE_W, SCREEN_H-botY, gc);
             tft.fillRect(fbPipes[i].x-3, botY, FB_PIPE_W+6, 15, tft.color565(30,140,30));
-            // Score
             if (fbPipes[i].x+FB_PIPE_W < FB_BIRD_X && fbPipes[i].x+FB_PIPE_W >= FB_BIRD_X-4) scored=true;
-            // Collision
             if (FB_BIRD_X+FB_BIRD_R > fbPipes[i].x && FB_BIRD_X-FB_BIRD_R < fbPipes[i].x+FB_PIPE_W) {
                 if (fbBirdY-FB_BIRD_R < fbPipes[i].gapY || fbBirdY+FB_BIRD_R > fbPipes[i].gapY+FB_GAP)
                     gameOver=true;
@@ -759,8 +766,10 @@ void runGame() {
             tft.setTextSize(2); tft.setTextColor(TFT_WHITE, tft.color565(80,180,255));
             tft.setCursor(60,240); tft.printf("Punts: %d", fbScore);
             delay(2000);
-            if (xSemaphoreTake(recordMutex, pdMS_TO_TICKS(200))==pdTRUE) {
-                saveRecord(fbScore); xSemaphoreGive(recordMutex);
+            if (fbScore > bestScore) {
+                if (xSemaphoreTake(recordMutex, pdMS_TO_TICKS(200))==pdTRUE) {
+                    saveRecord(fbScore); xSemaphoreGive(recordMutex);
+                }
             }
             return;
         }
