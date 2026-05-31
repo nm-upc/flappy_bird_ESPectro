@@ -293,14 +293,56 @@ void saveRecord(int score) {
     }
 }
 String getAllRecords() {
-    if (xSemaphoreTake(recordMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        int32_t best = loadRecord();
-        String hist  = loadHistory();
-        xSemaphoreGive(recordMutex);
-        return "{\"" + String(RECORD_KEY) + "\":{\"best\":" + String(best) +
-               ",\"history\":" + hist + "}}";
+    if (xSemaphoreTake(recordMutex, pdMS_TO_TICKS(100)) != pdTRUE)
+        return "{}";
+
+    nvs_handle_t h;
+    nvs_flash_init();
+    String json = "{";
+    if (nvs_open("records", NVS_READONLY, &h) == ESP_OK) {
+        char buf[256] = "";
+        size_t len = sizeof(buf);
+        nvs_get_str(h, "game_list", buf, &len);
+        String list = String(buf);
+        bool first = true;
+        int start = 0;
+        while (start <= (int)list.length()) {
+            int comma = list.indexOf(',', start);
+            String key = (comma < 0)
+                ? list.substring(start)
+                : list.substring(start, comma);
+            if (key.length() > 0) {
+                // Record maxim
+                int32_t best = 0;
+                nvs_get_i32(h, key.c_str(), &best);
+                // Comptador total
+                String ckey = key + "_c";
+                int32_t total = 0;
+                nvs_get_i32(h, ckey.c_str(), &total);
+                // Historial
+                String hkey = key + "_h";
+                String hist = "[]";
+                size_t hlen = 0;
+                if (nvs_get_str(h, hkey.c_str(), nullptr, &hlen) == ESP_OK && hlen > 0) {
+                    char* hbuf = new char[hlen];
+                    nvs_get_str(h, hkey.c_str(), hbuf, &hlen);
+                    hist = String(hbuf);
+                    delete[] hbuf;
+                }
+                if (!first) json += ",";
+                json += "\"" + key + "\":{\"best\":" + String(best) +
+                        ",\"total\":" + String(total) +
+                        ",\"history\":" + hist + "}";
+                first = false;
+            }
+            if (comma < 0) break;
+            start = comma + 1;
+        }
+        nvs_close(h);
     }
-    return "{\"" + String(RECORD_KEY) + "\":{\"best\":0,\"history\":[]}}";
+    json += "}";
+    xSemaphoreGive(recordMutex);
+    return json;
 }
 
 // ============================================================
