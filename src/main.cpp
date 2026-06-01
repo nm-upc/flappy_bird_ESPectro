@@ -663,114 +663,289 @@ int fbBirdY, fbBirdVY;
 int fbScore;
 #define FB_BIRD_X 60
 #define FB_BIRD_R 12
-#define FB_GRAVITY 2
-#define FB_FLAP   -14
+#define FB_GRAVITY 1        // acceleració per frame (abans 2 → massa nerviós)
+#define FB_FLAP   -12       // impuls del salt
+#define FB_MAX_FALL 11      // velocitat de caiguda màxima (evita plomades)
 #define FB_PIPE_W 40
-#define FB_GAP    100
+#define FB_GAP    120       // forat entre tubs (abans 100 → més indulgent)
 #define FB_MAX_PIPES 3
+#define FB_PIPE_SPEED 3     // velocitat de desplaçament dels tubs (px/frame)
+#define FB_GROUND_H   20    // alçada del terra
+// Franja (sprite) al voltant de l'ocell per dibuixar-lo sense parpelleig.
+// L'ocell viu sempre a la columna x=FB_BIRD_X, així que només cal bufferar
+// aquesta banda vertical (no cal un framebuffer de tota la pantalla).
+#define FB_BAND_X  42       // x esquerra de la franja
+#define FB_BAND_W  48       // amplada de la franja (cobreix cos + bec)
+// Control del joystick (eix Y, 0-4095) amb histèresi per evitar redisparades
+#define FB_JOY_HIGH   900   // cal superar aquesta deflexió per saltar
+#define FB_JOY_LOW    350   // cal tornar per sota per rearmar el salt
+#define FB_FLAP_COOLDOWN 130 // ms mínims entre salts
 struct FbPipe { int x, gapY; };
 FbPipe fbPipes[FB_MAX_PIPES];
-int fbPipeSpacing;
 bool fbStarted;
+
+// ── Àudio no bloquejant (tasca FreeRTOS dedicada) ────────────
+// El bucle del joc NOMÉS encua l'efecte; la tasca el reprodueix en
+// segon pla. Així playTone() (que bloqueja) no encalla mai el joc.
+struct SfxMsg { float freq; int dur; float vol; };
+QueueHandle_t sfxQueue = nullptr;
+
+void sfxTask(void* param) {
+    SfxMsg m;
+    while (true) {
+        if (xQueueReceive(sfxQueue, &m, portMAX_DELAY) == pdTRUE)
+            playTone(m.freq, m.dur, m.vol);
+    }
+}
+
+// Encua un efecte; si la cua és plena, es descarta (mai bloqueja)
+inline void sfx(float freq, int dur, float vol = 0.07f) {
+    if (sfxQueue) { SfxMsg m{freq, dur, vol}; xQueueSend(sfxQueue, &m, 0); }
+}
 
 
 // ============================================================
 //  TODO: LÒGICA DEL JOC
 // ============================================================
 void runGame() {
+    // Colors reutilitzats
+    const uint16_t SKY    = tft.color565(80, 180, 255);
+    const uint16_t PIPE   = tft.color565(50, 180, 50);
+    const uint16_t PIPE_D = tft.color565(30, 140, 30);
+    const uint16_t GROUND = tft.color565(80, 50, 10);
+    const uint16_t BEAK   = tft.color565(255, 120, 0);
+
     int bestScore = loadRecord();
-    fbBirdY=SCREEN_H/2; fbBirdVY=0; fbScore=0; fbStarted=false;
-    fbPipeSpacing = SCREEN_W + 20;
-    for (int i=0;i<FB_MAX_PIPES;i++) {
-        fbPipes[i].x = SCREEN_W + i*(SCREEN_W/FB_MAX_PIPES+20);
+
+    // ── Estat inicial ─────────────────────────────────────────
+    fbBirdY  = SCREEN_H / 2;
+    fbBirdVY = 0;
+    fbScore  = 0;
+    fbStarted = false;
+    for (int i = 0; i < FB_MAX_PIPES; i++) {
+        fbPipes[i].x    = SCREEN_W + i * (SCREEN_W / FB_MAX_PIPES + 20);
         fbPipes[i].gapY = 80 + random(SCREEN_H - FB_GAP - 160);
     }
 
-    tft.fillScreen(tft.color565(80,180,255));
-    tft.setTextColor(TFT_WHITE, tft.color565(80,180,255)); tft.setTextSize(2);
-    tft.setCursor(40,200); tft.print("Prem A per saltar!");
-    tft.setCursor(60,230); tft.print("B = sortir");
+    // Crea la tasca d'àudio un sol cop (core 0, com la de WiFi)
+    static bool audioReady = false;
+    if (!audioReady) {
+        sfxQueue = xQueueCreate(8, sizeof(SfxMsg));
+        xTaskCreatePinnedToCore(sfxTask, "sfx", 4096, NULL, 2, NULL, 0);
+        audioReady = true;
+    }
 
-    bool aPrev=false, gameOver=false;
-    unsigned long lastFrame=millis();
+    // Sprite de la franja de l'ocell (doble buffer parcial, sense parpelleig).
+    // Es crea un sol cop; si no hi ha prou memòria, useLayer=false i es
+    // dibuixa l'ocell de la manera directa (amb una mica de parpelleig).
+    static LGFX_Sprite birdLayer(&tft);
+    static bool layerInit = false, useLayer = false;
+    if (!layerInit) {
+        birdLayer.setColorDepth(16);
+        birdLayer.createSprite(FB_BAND_W, SCREEN_H);
+        useLayer  = (birdLayer.getBuffer() != nullptr);
+        layerInit = true;
+    }
 
+    // ── Calibratge del joystick (centre en repòs) ─────────────
+    long sum = 0;
+    for (int i = 0; i < 16; i++) { sum += analogRead(JOY_Y_PIN); delay(2); }
+    int joyCenter = sum / 16;
+
+    // Detector de "salt" amb histèresi + temps mínim entre salts:
+    //   - salta quan el joystick es mou fort (eix Y) o es clica (JOY_SW)
+    //   - cal recentrar-lo (per sota de FB_JOY_LOW) per rearmar
+    //   - i deixar passar FB_FLAP_COOLDOWN ms → no es redispara sol
+    bool flapArmed = true;
+    unsigned long lastFlap = 0;
+    auto readFlap = [&]() -> bool {
+        int  defl    = abs(analogRead(JOY_Y_PIN) - joyCenter);
+        bool clicked = (digitalRead(JOY_SW_PIN) == LOW);
+        bool strong  = (defl > FB_JOY_HIGH) || clicked;
+        bool weak    = (defl < FB_JOY_LOW)  && !clicked;
+
+        if (weak) flapArmed = true;          // recentrat → rearma
+        if (strong && flapArmed &&
+            millis() - lastFlap > FB_FLAP_COOLDOWN) {
+            flapArmed = false;
+            lastFlap  = millis();
+            return true;
+        }
+        return false;
+    };
+
+    // ── Pantalla d'espera ─────────────────────────────────────
+    tft.fillScreen(SKY);
+    tft.setTextColor(TFT_WHITE, SKY);
+    tft.setTextSize(2);
+    tft.setCursor(20, 200); tft.print("Mou el joystick");
+    tft.setCursor(45, 225); tft.print("per saltar!");
+    tft.setCursor(60, 260); tft.print("B = sortir");
+
+    // Espera fins que es mogui el joystick per començar (o B per sortir)
+    while (!fbStarted) {
+        if (digitalRead(BTN_B_PIN) == LOW) return;   // sortir sense jugar (no compta)
+        if (readFlap()) {
+            fbStarted = true;
+            fbBirdVY  = FB_FLAP;
+            sfx(440, 30);
+            tft.fillScreen(SKY);                     // neteja el text d'inici
+        }
+        delay(20);
+    }
+
+    int  prevBirdY = fbBirdY;
+    bool gameOver  = false;
+    unsigned long lastFrame = millis();
+
+    // ── Bucle principal del joc (~40 fps) ─────────────────────
     while (true) {
-        if (millis()-lastFrame < 25) continue;
-        lastFrame=millis();
+        if (millis() - lastFrame < 25) { delay(1); continue; }
+        lastFrame = millis();
 
-        bool btnA=(digitalRead(BTN_A_PIN)==LOW);
-        bool btnB=(digitalRead(BTN_B_PIN)==LOW);
+        bool btnB = (digitalRead(BTN_B_PIN) == LOW);
+
+        // Sortida manual: es desa la partida (compta com a jugada)
         if (btnB) {
-            if (fbScore > bestScore) {
-                if (xSemaphoreTake(recordMutex, pdMS_TO_TICKS(200))==pdTRUE) {
-                    saveRecord(fbScore); xSemaphoreGive(recordMutex);
-                }
+            if (xSemaphoreTake(recordMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                saveRecord(fbScore);
+                xSemaphoreGive(recordMutex);
             }
             return;
         }
-        if (btnA && !aPrev && !fbStarted) fbStarted=true;
-        if (btnA && !aPrev && fbStarted) { fbBirdVY=FB_FLAP; playTone(440,30,0.07f); }
-        aPrev=btnA;
-        if (!fbStarted) continue;
 
-        // Physics
+        // Salt amb el joystick (moviment fort o clic), amb histèresi + cooldown
+        if (readFlap()) { fbBirdVY = FB_FLAP; sfx(440, 30); }
+
+        // ── Física ────────────────────────────────────────────
         fbBirdVY += FB_GRAVITY;
-        int prevBirdY=fbBirdY;
-        fbBirdY = constrain(fbBirdY + fbBirdVY, FB_BIRD_R, SCREEN_H-FB_BIRD_R);
+        if (fbBirdVY > FB_MAX_FALL) fbBirdVY = FB_MAX_FALL;   // limita la caiguda
+        prevBirdY = fbBirdY;
+        fbBirdY = constrain(fbBirdY + fbBirdVY, FB_BIRD_R, SCREEN_H - FB_BIRD_R);
 
+        bool scored = false;
+
+        // ── Dibuix directe de l'escenari (tubs + terra) ───────
         tft.startWrite();
 
-        // Esborra ocell anterior
-        tft.fillCircle(FB_BIRD_X, prevBirdY, FB_BIRD_R+2, tft.color565(80,180,255));
+        // Canonades
+        for (int i = 0; i < FB_MAX_PIPES; i++) {
+            fbPipes[i].x -= FB_PIPE_SPEED;
 
-        bool scored=false;
-        for (int i=0;i<FB_MAX_PIPES;i++) {
-            // Esborra posició anterior de la canonada
-            tft.fillRect(fbPipes[i].x+4, 0, 8, SCREEN_H-20, tft.color565(80,180,255));
+            // Esborra el rastre que deixa el tub pel costat dret
+            // (el tub es mou cap a l'esquerra, així que la vora dreta queda enrere)
+            tft.fillRect(fbPipes[i].x + FB_PIPE_W, 0,
+                         FB_PIPE_SPEED + 16, SCREEN_H - FB_GROUND_H, SKY);
 
-            fbPipes[i].x -= 4;
+            // Reciclatge quan surt completament per l'esquerra
             if (fbPipes[i].x < -FB_PIPE_W) {
-                fbPipes[i].x = SCREEN_W;
+                fbPipes[i].x    = SCREEN_W;
                 fbPipes[i].gapY = 80 + random(SCREEN_H - FB_GAP - 160);
             }
-            uint16_t gc = tft.color565(50,180,50);
-            tft.fillRect(fbPipes[i].x, 0, FB_PIPE_W, fbPipes[i].gapY, gc);
-            tft.fillRect(fbPipes[i].x-3, fbPipes[i].gapY-15, FB_PIPE_W+6, 15, tft.color565(30,140,30));
-            int botY=fbPipes[i].gapY+FB_GAP;
-            tft.fillRect(fbPipes[i].x, botY, FB_PIPE_W, SCREEN_H-botY, gc);
-            tft.fillRect(fbPipes[i].x-3, botY, FB_PIPE_W+6, 15, tft.color565(30,140,30));
-            if (fbPipes[i].x+FB_PIPE_W < FB_BIRD_X && fbPipes[i].x+FB_PIPE_W >= FB_BIRD_X-4) scored=true;
-            if (FB_BIRD_X+FB_BIRD_R > fbPipes[i].x && FB_BIRD_X-FB_BIRD_R < fbPipes[i].x+FB_PIPE_W) {
-                if (fbBirdY-FB_BIRD_R < fbPipes[i].gapY || fbBirdY+FB_BIRD_R > fbPipes[i].gapY+FB_GAP)
-                    gameOver=true;
+
+            int x    = fbPipes[i].x;
+            int gapY = fbPipes[i].gapY;
+            int botY = gapY + FB_GAP;
+
+            // Tub superior + boca
+            tft.fillRect(x, 0, FB_PIPE_W, gapY, PIPE);
+            tft.fillRect(x - 3, gapY - 15, FB_PIPE_W + 6, 15, PIPE_D);
+            // Tub inferior + boca
+            tft.fillRect(x, botY, FB_PIPE_W, (SCREEN_H - FB_GROUND_H) - botY, PIPE);
+            tft.fillRect(x - 3, botY, FB_PIPE_W + 6, 15, PIPE_D);
+
+            // Puntuació: l'ocell acaba de passar el tub
+            if (x + FB_PIPE_W < FB_BIRD_X && x + FB_PIPE_W >= FB_BIRD_X - FB_PIPE_SPEED)
+                scored = true;
+
+            // Col·lisió amb el tub
+            if (FB_BIRD_X + FB_BIRD_R > x && FB_BIRD_X - FB_BIRD_R < x + FB_PIPE_W) {
+                if (fbBirdY - FB_BIRD_R < gapY || fbBirdY + FB_BIRD_R > botY)
+                    gameOver = true;
             }
         }
-        if (scored) { fbScore++; playTone(660,40,0.07f); }
-        // Ground
-        tft.fillRect(0, SCREEN_H-20, SCREEN_W, 20, tft.color565(80,50,10));
-        if (fbBirdY >= SCREEN_H-20-FB_BIRD_R) gameOver=true;
-        // Bird
-        tft.fillCircle(FB_BIRD_X, fbBirdY, FB_BIRD_R, TFT_YELLOW);
-        tft.fillCircle(FB_BIRD_X+6, fbBirdY-4, 4, TFT_WHITE);
-        tft.fillCircle(FB_BIRD_X+7, fbBirdY-3, 2, TFT_BLACK);
-        tft.fillTriangle(FB_BIRD_X+FB_BIRD_R, fbBirdY, FB_BIRD_X+FB_BIRD_R+8, fbBirdY-3, FB_BIRD_X+FB_BIRD_R+8, fbBirdY+3, tft.color565(255,120,0));
-        // HUD
-        tft.setTextColor(TFT_WHITE, tft.color565(80,180,255)); tft.setTextSize(2);
-        tft.setCursor(10,10); tft.printf("Pts:%d  Rec:%d", fbScore, bestScore);
+
+        // Terra
+        tft.fillRect(0, SCREEN_H - FB_GROUND_H, SCREEN_W, FB_GROUND_H, GROUND);
+        if (fbBirdY + FB_BIRD_R >= SCREEN_H - FB_GROUND_H) gameOver = true;
+
         tft.endWrite();
 
-        if (gameOver) {
-            playTone(200,400,0.12f);
-            tft.setTextColor(TFT_RED, tft.color565(80,180,255)); tft.setTextSize(3);
-            tft.setCursor(50,200); tft.print("GAME OVER");
-            tft.setTextSize(2); tft.setTextColor(TFT_WHITE, tft.color565(80,180,255));
-            tft.setCursor(60,240); tft.printf("Punts: %d", fbScore);
-            delay(2000);
-            if (fbScore > bestScore) {
-                if (xSemaphoreTake(recordMutex, pdMS_TO_TICKS(200))==pdTRUE) {
-                    saveRecord(fbScore); xSemaphoreGive(recordMutex);
-                }
+        if (scored) fbScore++;
+
+        // ── Ocell ─────────────────────────────────────────────
+        if (useLayer) {
+            // Es redibuixa tota la franja en memòria i es bolca d'un sol cop:
+            // l'ocell no "desapareix" mai perquè no s'esborra a pantalla.
+            const int groundTop = SCREEN_H - FB_GROUND_H;
+            birdLayer.fillScreen(SKY);
+
+            // Trossos de tub que cauen dins de la franja
+            for (int i = 0; i < FB_MAX_PIPES; i++) {
+                int lx   = fbPipes[i].x - FB_BAND_X;     // x relativa a la franja
+                int gapY = fbPipes[i].gapY;
+                int botY = gapY + FB_GAP;
+                birdLayer.fillRect(lx, 0, FB_PIPE_W, gapY, PIPE);
+                birdLayer.fillRect(lx - 3, gapY - 15, FB_PIPE_W + 6, 15, PIPE_D);
+                birdLayer.fillRect(lx, botY, FB_PIPE_W, groundTop - botY, PIPE);
+                birdLayer.fillRect(lx - 3, botY, FB_PIPE_W + 6, 15, PIPE_D);
             }
+            // Terra dins de la franja
+            birdLayer.fillRect(0, groundTop, FB_BAND_W, FB_GROUND_H, GROUND);
+
+            // Ocell (coordenades relatives a la franja)
+            int bx = FB_BIRD_X - FB_BAND_X;
+            birdLayer.fillCircle(bx, fbBirdY, FB_BIRD_R, TFT_YELLOW);
+            birdLayer.fillCircle(bx + 6, fbBirdY - 4, 4, TFT_WHITE);
+            birdLayer.fillCircle(bx + 7, fbBirdY - 3, 2, TFT_BLACK);
+            birdLayer.fillTriangle(bx + FB_BIRD_R,     fbBirdY,
+                                   bx + FB_BIRD_R + 8, fbBirdY - 3,
+                                   bx + FB_BIRD_R + 8, fbBirdY + 3, BEAK);
+
+            birdLayer.pushSprite(FB_BAND_X, 0);
+        } else {
+            // Fallback sense sprite: esborra i redibuixa directament
+            tft.startWrite();
+            tft.fillRect(FB_BIRD_X - FB_BIRD_R - 2, prevBirdY - FB_BIRD_R - 2,
+                         (FB_BIRD_R * 2) + 14, (FB_BIRD_R * 2) + 4, SKY);
+            tft.fillCircle(FB_BIRD_X, fbBirdY, FB_BIRD_R, TFT_YELLOW);
+            tft.fillCircle(FB_BIRD_X + 6, fbBirdY - 4, 4, TFT_WHITE);
+            tft.fillCircle(FB_BIRD_X + 7, fbBirdY - 3, 2, TFT_BLACK);
+            tft.fillTriangle(FB_BIRD_X + FB_BIRD_R,     fbBirdY,
+                             FB_BIRD_X + FB_BIRD_R + 8, fbBirdY - 3,
+                             FB_BIRD_X + FB_BIRD_R + 8, fbBirdY + 3, BEAK);
+            tft.endWrite();
+        }
+
+        // ── HUD (a sobre de tot) ──────────────────────────────
+        tft.setTextColor(TFT_WHITE, SKY);
+        tft.setTextSize(2);
+        tft.setCursor(10, 10);
+        tft.printf("Pts:%d  Rec:%d ", fbScore, bestScore);
+
+        // El so es reprodueix en segon pla (no bloqueja el bucle)
+        if (scored) sfx(660, 40);
+
+        // ── Fi de partida ─────────────────────────────────────
+        if (gameOver) {
+            sfx(180, 250, 0.10f);
+            tft.setTextColor(TFT_RED, SKY); tft.setTextSize(3);
+            tft.setCursor(50, 200); tft.print("GAME OVER");
+            tft.setTextSize(2); tft.setTextColor(TFT_WHITE, SKY);
+            tft.setCursor(60, 240); tft.printf("Punts: %d", fbScore);
+            if (fbScore > bestScore) {
+                tft.setTextColor(TFT_YELLOW, SKY);
+                tft.setCursor(45, 275); tft.print("NOU RECORD!");
+            }
+
+            // Desa SEMPRE: historial + comptador de partides (+ record si cal).
+            // saveRecord() ja actualitza el màxim només si la puntuació és més alta.
+            if (xSemaphoreTake(recordMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                saveRecord(fbScore);
+                xSemaphoreGive(recordMutex);
+            }
+
+            delay(2500);
             return;
         }
     }
